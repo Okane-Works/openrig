@@ -57,6 +57,14 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
 
   get environment() { return this.runtime === "openshell-claude" ? this.deps.environmentStartup?.platform : undefined; }
 
+  async preflightLaunch(_binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    if (!found.ok) return { ok: false, error: found.message };
+    if (found.preset.runner && !found.preset.launchWrapper)
+      return { ok: false, error: unsupportedCommunityRunnerLaunchWrapperMessage(this.runtime) };
+    return { ok: true };
+  }
+
   private contained(): EnvironmentStartup | undefined {
     if (this.runtime !== "openshell-claude") return undefined;
     if (!this.deps.environmentStartup) throw new Error("OpenShell environment operations are unavailable; no host fallback was attempted");

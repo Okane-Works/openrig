@@ -8,10 +8,11 @@ import { readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 import { isLaunchWrapperRuntime, readSeatLaunchWrapper } from "./launch-wrapper.js";
 import { ulid } from "ulid";
 import type { RigRepository } from "./rig-repository.js";
-import { SessionAddressConflict, savedSessionName, type SessionRegistry } from "./session-registry.js";
+import { SessionAddressConflict, savedSessionName, sessionCommunityHarnessSelect, type SessionRegistry } from "./session-registry.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
+import { seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { SeatStatusService, type SeatStatus, type SeatStatusResult } from "./seat-status-service.js";
@@ -229,6 +230,7 @@ interface SessionRow {
   id: string;
   session_name: string;
   status: string;
+  community_harness: string | null;
 }
 
 interface BindingOwnerRow {
@@ -336,6 +338,7 @@ export class SeatHandoverService {
   private discoveryRepo: DiscoveryRepository;
   private eventBus: EventBus;
   private tmuxAdapter: TmuxAdapter;
+  private runtimeAdapters: Record<string, RuntimeAdapter>;
   private successorLauncher: SuccessorSessionLauncher;
   private captureDeps: ResumeTokenCaptureDeps;
   private occupantInvalidator: OccupantInvalidator | null;
@@ -365,6 +368,7 @@ export class SeatHandoverService {
     this.discoveryRepo = deps.discoveryRepo;
     this.eventBus = deps.eventBus;
     this.tmuxAdapter = deps.tmuxAdapter;
+    this.runtimeAdapters = deps.runtimeAdapters ?? {};
     this.occupantInvalidator = deps.occupantInvalidator ?? null;
     this.activityOracle = deps.activityOracle ?? null;
     this.predecessorRecapResolver = deps.predecessorRecapResolver ?? null;
@@ -413,6 +417,17 @@ export class SeatHandoverService {
         if (parsed.ok && parsed.source.mode === "fork" && parsed.source.ref && status.ok) {
           const fork = this.resolveForkSource(parsed.source.ref, this.lookupNode(status.status).runtime);
           if (!fork.ok) return fork;
+        }
+        if (status.ok) {
+          const node = this.lookupNode(status.status);
+          const currentSession = this.lookupLatestSession(node.id);
+          let adapter: RuntimeAdapter | undefined;
+          let adapterError: string | undefined;
+          try { adapter = seatAdapter(this.runtimeAdapters, node.runtime, currentSession?.community_harness); }
+          catch (error) { adapterError = error instanceof Error ? error.message : String(error); }
+          planResult.plan.runtimeAdapter = adapter
+            ? { status: "resolved_unverified", detail: "The recorded runtime adapter resolved. Dry-run did not start it or check readiness." }
+            : { status: "unsupported", detail: adapterError ?? `No adapter resolves runtime "${node.runtime ?? "unknown"}"${currentSession?.community_harness ? ` with community harness "${currentSession.community_harness}"` : ""}.` };
         }
         return { ok: true, plan: planResult.plan };
       }
@@ -672,7 +687,7 @@ export class SeatHandoverService {
       // spec (else the running topology drifts from the founder-designed one at every handover).
       // A4-profile: likewise carry the codex config profile (adapter emits -p) — the restore path
       // already threads it; handover must too, or a profile-pinned codex seat reverts at handover.
-      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, ...(codexRebuildPermissions ? { codexRebuildPermissions } : {}), ...(seatAdditions.additions ? { launchAdditions: seatAdditions.additions } : {}), ...(launchWrapper?.length ? { launchWrapper } : {}), claudePermissions: permissionOverride.claudePermissions, claudeAutoMode: permissionOverride.claudeAutoMode, claudeMcp, codexPermissions: permissionOverride.codexPermissions, kernelAuthority: permissionOverride.kernelAuthority, teamPermissionDefault: permissionOverride.teamPermissionDefault, nonInterruptive: this.rigRepo.getRigNonInterruptive(statusResult.status.rig_id), launchPosture: effectivePosture, ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}), model: node.model, effort: readSeatEffort(this.db, node.id)?.effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined, seatEnv: withPluginDirs(this.rigRepo.getEffectiveSeatEnv(node.id), [corePluginDir, seatSkillDir, ...additionPluginDirs]), ...((corePluginDir || codexCorePluginDir) && node.cwd ? { seatProjectDir: node.cwd } : {}) },
+      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, communityHarness: latestSession.community_harness, ...(codexRebuildPermissions ? { codexRebuildPermissions } : {}), ...(seatAdditions.additions ? { launchAdditions: seatAdditions.additions } : {}), ...(launchWrapper?.length ? { launchWrapper } : {}), claudePermissions: permissionOverride.claudePermissions, claudeAutoMode: permissionOverride.claudeAutoMode, claudeMcp, codexPermissions: permissionOverride.codexPermissions, kernelAuthority: permissionOverride.kernelAuthority, teamPermissionDefault: permissionOverride.teamPermissionDefault, nonInterruptive: this.rigRepo.getRigNonInterruptive(statusResult.status.rig_id), launchPosture: effectivePosture, ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}), model: node.model, effort: readSeatEffort(this.db, node.id)?.effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined, seatEnv: withPluginDirs(this.rigRepo.getEffectiveSeatEnv(node.id), [corePluginDir, seatSkillDir, ...additionPluginDirs]), ...((corePluginDir || codexCorePluginDir) && node.cwd ? { seatProjectDir: node.cwd } : {}) },
       departingSessionName: latestSession.session_name,
       occupantGeneration,
       // OPR.0.5.5.5: a fork-sourced successor launches as a NATIVE FORK of the
@@ -1846,7 +1861,7 @@ export class SeatHandoverService {
 
   private lookupLatestSession(nodeId: string): SessionRow | null {
     return this.db.prepare(
-      "SELECT id, session_name, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1"
+      `SELECT id, session_name, status, ${sessionCommunityHarnessSelect(this.db, "sessions")} AS community_harness FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1`
     ).get(nodeId) as SessionRow | undefined ?? null;
   }
 
