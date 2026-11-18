@@ -28,6 +28,10 @@ export interface SeatHandoverPlan {
   ok: true;
   dryRun: true;
   willMutate: false;
+runtimeAdapter?: {
+status: "unsupported" | "resolved_unverified";
+detail: string;
+};
   seat: {
     ref: string;
     rigId: string;

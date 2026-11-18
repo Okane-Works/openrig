@@ -6,6 +6,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { RuntimeHint } from "./discovery-types.js";
 import type { RuntimeAdapter, NodeBinding, ReadinessResult, ForkSource } from "./runtime-adapter.js";
+import { seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { isAttentionRequiredReadinessCode } from "./runtime-adapter.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
@@ -46,6 +47,7 @@ export interface SuccessorNode {
   id: string;
   runtime: string | null;
   cwd: string | null;
+  communityHarness?: string | null;
   /** OPR.0.4.8.3 Seam B: the departing seat's PERSISTED resolved launch posture —
    *  the successor is a CONTINUITY edge of the same seat, so its policy posture
    *  carries (populated by the caller from node provenance; absent = env decision). */
@@ -272,9 +274,16 @@ export class SuccessorSessionLauncher {
     }
 
     const binding = successorBinding(input.node, departingSession, pane.id, cwd, input.occupantGeneration);
-    const adapter = input.node.runtime ? this.runtimeAdapters[input.node.runtime] : undefined;
+    let adapter: RuntimeAdapter | undefined;
+    try { adapter = seatAdapter(this.runtimeAdapters, input.node.runtime, input.node.communityHarness); }
+    catch (error) {
+      return { ok: false, code: "successor_runtime_unsupported", step: "create_successor", message: `Could not resolve runtime adapter before ending incumbent: ${error instanceof Error ? error.message : String(error)}`, replacementStarted: false };
+    }
+    if (!adapter) {
+      return { ok: false, code: "successor_runtime_unsupported", step: "create_successor", message: `No runtime adapter for "${input.node.runtime ?? "unknown"}"; the incumbent was left running.`, replacementStarted: false };
+    }
     let preflightWarnings: string[] = [];
-    if (adapter?.preflightLaunch) {
+    if (adapter.preflightLaunch) {
       try {
         const checked = await adapter.preflightLaunch(binding);
         if (!checked.ok) return { ok: false, code: "successor_preflight_failed", step: "create_successor",
@@ -349,7 +358,7 @@ export class SuccessorSessionLauncher {
     //    not repointed. When the harness launch was already sent and only readiness failed, the pane is NOT left as
     //    a bare shell: the successor may still come up there, unadopted (#2985). The failure says so, so the caller
     //    can tell the operator that a retry would end it.
-    const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration, undefined, binding);
+    const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration, undefined, binding, adapter);
     if (!started.ok) {
       return { ok: false, code: started.code, step: "start_agent", message: started.message, replacementStarted: true,
         tmuxPane: pane.id, ...limitsNotice, ...(started.launched ? { successorLaunched: true, retireeExit: terminated.path,
@@ -434,8 +443,10 @@ export class SuccessorSessionLauncher {
       if (!blank.ok) {
         return { ok: false, code: "successor_pane_not_blank", message: `The staging pane is running ${blank.observed ?? "an unknown command"}, not a blank shell; the target runtime wasn't started.`, ...limitsNotice };
       }
+      const adapter = seatAdapter(this.runtimeAdapters, input.node.runtime, input.node.communityHarness);
+      if (!adapter) return { ok: false, code: "successor_runtime_unsupported", message: `No runtime adapter for "${input.node.runtime ?? "unknown"}"; the staging session was left for caller cleanup.`, ...limitsNotice };
       const started = await this.startAgent(input.node, input.stagingSession, pane, input.node.cwd ?? undefined,
-        undefined, input.occupantGeneration, { ...input.staged, canonicalSession: input.canonicalSession });
+        undefined, input.occupantGeneration, { ...input.staged, canonicalSession: input.canonicalSession }, undefined, adapter);
       if (!started.ok) return { ...started, ...limitsNotice };
       const notes = [...(started.notes ?? []), ...(created.warnings ?? [])];
       return { ...started, tmuxPane: pane, ...(notes.length ? { notes } : {}), ...limitsNotice };
@@ -460,9 +471,10 @@ export class SuccessorSessionLauncher {
     launchGeneration?: string | null,
     staged?: StagedLaunch,
     preparedBinding?: NodeBinding,
+    resolvedAdapter?: RuntimeAdapter,
   ): Promise<{ ok: true; activityGrantId?: string; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; notes?: string[]; launchedExecutable?: { path: string; isScript: boolean } }
     | { ok: false; code: string; message: string; launched?: true; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; launchedExecutable?: { path: string; isScript: boolean } }> {
-    const adapter = node.runtime ? this.runtimeAdapters[node.runtime] : undefined;
+    const adapter = resolvedAdapter ?? seatAdapter(this.runtimeAdapters, node.runtime, node.communityHarness);
     if (!adapter) {
       return {
         ok: false,
