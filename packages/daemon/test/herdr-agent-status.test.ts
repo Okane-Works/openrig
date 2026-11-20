@@ -22,6 +22,7 @@ function herdr(panes: Record<string, unknown[] | null>) {
   /** Extra raw entries for the pane list, to make it malformed. */
   const extraPanes: unknown[] = [];
   const failing = new Set<string>();
+  const authorities = new Map<string, { source: string; agent: string; state: unknown }>();
   let gate: Promise<void> | null = null;
   const transport: HerdrTransport = {
     async probe() { return { alive: true, version: null, protocol: null }; },
@@ -30,18 +31,24 @@ function herdr(panes: Record<string, unknown[] | null>) {
       calls.push({ method, params: p });
       if (gate && method === "pane.report_agent") await gate;
       if (failing.has(method)) throw new Error(`${method} failed`);
-      if (method === "pane.list") return { type: "pane_list", panes: [...Object.keys(panes).map((pane_id) => ({ pane_id, agent: "claude" })), ...extraPanes] };
+      if (method === "pane.list") return { type: "pane_list", panes: [...Object.keys(panes).map((pane_id) => ({ pane_id, agent: authorities.get(pane_id)?.agent ?? null })), ...extraPanes] };
       if (method === "pane.process_info") {
         const pids = panes[p["pane_id"] as string];
         if (!pids) throw new Error("unreadable");
         return { type: "pane_process_info", process_info: { foreground_processes: pids.map((pid) => ({ pid, argv: ["tmux"] })) } };
+      }
+      if (method === "pane.report_agent") authorities.set(p["pane_id"] as string, { source: p["source"] as string, agent: p["agent"] as string, state: p["state"] });
+      if (method === "pane.release_agent") {
+        const held = authorities.get(p["pane_id"] as string);
+        // Herdr rejects source OR agent mismatches without mutation.
+        if (held?.source === p["source"] && held.agent === p["agent"]) authorities.delete(p["pane_id"] as string);
       }
       return { type: "ok" };
     },
   };
   const of = (method: string) => calls.filter((c) => c.method === method).map((c) => c.params);
   return {
-    transport, panes, calls, failing, extraPanes,
+    transport, panes, calls, failing, extraPanes, authorities,
     reports: () => of("pane.report_agent"),
     releases: () => of("pane.release_agent"),
     /** Holds every report until the returned function is called. */
@@ -94,6 +101,53 @@ describe("herdrAgentState", () => {
 });
 
 describe("HerdrAgentStatusRelay", () => {
+  it.each(["detached", "builtin"])("recovers a previous daemon's report after restart when %s", async (mode) => {
+    const h = herdr({ p1: [501] });
+    const clients = [{ pid: 501, session: "s" }];
+    const seats = { s: { activity: activity("running"), runtime: "jcode" } as HerdrSeatActivity };
+    const first = rig({ endpoints: [h], clients, seats });
+    await first.relay.sweep();
+    first.relay.stop();
+    if (mode === "detached") h.panes["p1"] = [];
+    else seats.s.runtime = "claude-code";
+    const restarted = rig({ endpoints: [h], clients, seats });
+    restarted.clock.now++;
+    h.failing.add("pane.release_agent");
+    await restarted.relay.sweep();
+    expect(h.authorities.get("p1")?.source).toBe(HERDR_COMMUNITY_SOURCE);
+    h.failing.clear();
+    await restarted.relay.sweep();
+    expect(h.authorities.has("p1")).toBe(false);
+    expect(h.releases().at(-1)).toMatchObject({ source: HERDR_COMMUNITY_SOURCE, agent: "jcode" });
+    expect(h.reports()).toHaveLength(1);
+  });
+
+  it.each(["jcode", "claude"])("preserves a foreign reporter labelled %s during restart recovery", async (agent) => {
+    const h = herdr({ p1: [] });
+    const foreign = { source: "other-reporter", agent, state: "blocked" };
+    h.authorities.set("p1", foreign);
+    const r = rig({ endpoints: [h], clients: [], seats: {} });
+    await r.relay.sweep();
+    expect(h.releases()).toEqual([{ pane_id: "p1", source: HERDR_COMMUNITY_SOURCE, agent, seq: 1_000_000 }]);
+    expect(h.authorities.get("p1")).toEqual(foreign);
+    expect(h.reports()).toEqual([]);
+    expect(h.calls.some((call) => call.method === "pane.clear_agent_authority")).toBe(false);
+  });
+
+  it("keeps previous-daemon authority until process and seat inventories are readable", async () => {
+    const h = herdr({ p1: null });
+    h.authorities.set("p1", { source: HERDR_COMMUNITY_SOURCE, agent: "jcode", state: "working" });
+    const r = rig({ endpoints: [h], clients: [{ pid: 501, session: "s" }], seats: {} });
+    await r.relay.sweep();
+    h.panes["p1"] = [501];
+    r.unresolvable.add("s");
+    await r.relay.sweep();
+    expect(h.releases()).toEqual([]);
+    r.unresolvable.clear();
+    await r.relay.sweep();
+    expect(h.authorities.has("p1")).toBe(false);
+  });
+
   it("reports a community harness seat to the pane running its tmux client", async () => {
     const { h, relay } = jcodeRig();
     await relay.sweep();
@@ -130,8 +184,10 @@ describe("HerdrAgentStatusRelay", () => {
   });
 
   it("attributes by pid, never by the pane's label, among several foreground processes", async () => {
-    // pane.list labels every pane "claude"; only the pid decides.
+    // Pane labels are not used to attribute a viewer, only its foreground pid is.
     const h = herdr({ p1: [10, 11, 12], p2: [20] });
+    h.authorities.set("p1", { source: "other-reporter", agent: "claude", state: "idle" });
+    h.authorities.set("p2", { source: "other-reporter", agent: "jcode", state: "idle" });
     const r = rig({
       endpoints: [h],
       clients: [{ pid: 12, session: "s1" }, { pid: 77, session: "s2" }],

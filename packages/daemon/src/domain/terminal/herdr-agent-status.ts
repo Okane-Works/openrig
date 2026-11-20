@@ -10,8 +10,9 @@ import type { HerdrTransport } from "./herdr-transport.js";
  * panes whose foreground process is a tmux client of that seat's session.
  *
  * A pane is attributed by process id only: Herdr's foreground pids for the pane against the client pids of the
- * daemon's own tmux server. Titles and agent labels are never read. Built-in runtimes are never reported here: Herdr
- * shows those viewers by its own means, and a held report would replace that.
+ * daemon's own tmux server. Titles and agent labels never attribute a viewer. A pane's reported agent label is
+ * only a candidate for source-guarded cleanup of a previous daemon's report. Built-in runtimes are never reported
+ * here: Herdr shows those viewers by its own means, and a held report would replace that.
  *
  * Every reading is all or nothing. A client list, pane list or process list with one entry that can't be read is
  * treated as unread, as is a seat that can't be resolved: what was last reported stays, and nothing is released.
@@ -174,10 +175,12 @@ export class HerdrAgentStatusRelay {
     const panes = await read(async () => {
       const listed = (await transport.request("pane.list", {}))["panes"];
       if (!Array.isArray(listed)) throw new Error("no panes");
-      return listed.map((p): string => {
+      return listed.map((p): { id: string; agent: string | null } => {
         const id = (p as { pane_id?: unknown } | null)?.pane_id;
         if (typeof id !== "string" || !id) throw new Error("pane without an id");
-        return id;
+        const agent = (p as { agent?: unknown }).agent;
+        if (agent !== undefined && agent !== null && (typeof agent !== "string" || !agent)) throw new Error("unreadable agent");
+        return { id, agent: typeof agent === "string" ? agent : null };
       });
     });
     // An unreadable pane list keeps every held pane as it is, for the next sweep.
@@ -186,10 +189,10 @@ export class HerdrAgentStatusRelay {
     const held = this.held.get(key) ?? new Map<string, Held>();
     this.held.set(key, held);
     // A pane Herdr no longer lists took its agent state with it.
-    const live = new Set(panes.value);
+    const live = new Set(panes.value.map((pane) => pane.id));
     for (const paneId of held.keys()) if (!live.has(paneId)) held.delete(paneId);
 
-    for (const paneId of panes.value) {
+    for (const { id: paneId, agent } of panes.value) {
       if (this.stopped) return;
       const pids = await read(async () => {
         const info = (await transport.request("pane.process_info", { pane_id: paneId }))["process_info"];
@@ -206,6 +209,16 @@ export class HerdrAgentStatusRelay {
       if (this.stopped) return;
       const want = this.wanted(pids.value, sessionByPid);
       if (!want.ok) continue;
+      // PaneInfo has no lifecycle-source inventory. After a daemon restart its displayed agent is only a
+      // release candidate, never evidence of ownership. Herdr's release_agent checks BOTH source and agent
+      // before mutating authority, so this also leaves another reporter's identical label alone.
+      // Only readable process/seat attribution can prove we no longer need a community report.
+      if (!want.value && !held.has(paneId) && agent) {
+        try {
+          await transport.request("pane.release_agent", { pane_id: paneId, source: HERDR_COMMUNITY_SOURCE, agent, seq: this.seq() });
+        } catch { /* Herdr's inventory retains the candidate for the next sweep. */ }
+        continue;
+      }
       await this.settle(transport, held, paneId, want.value);
     }
   }

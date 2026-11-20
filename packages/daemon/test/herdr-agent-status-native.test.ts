@@ -74,11 +74,27 @@ it.skipIf(process.env.OPENRIG_TEST_HERDR_NATIVE !== "1" || process.platform === 
         const agents = await transport.request("agent.list", {});
         expect(agents.agents).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: paneId, agent: "jcode-lead", agent_status: displayed })]));
       }
+      // Herdr keeps a held report while the OpenRig daemon restarts. A new
+      // relay must release that report even though its in-memory cache is empty.
+      const newRelay = () => new HerdrAgentStatusRelay({ clients, transports: () => [transport],
+        resolve: () => seat, sweep: false });
+      relay.stop();
+      seat.runtime = "codex";
+      relay = newRelay();
+      await relay.sweep();
+      expect((await transport.request("pane.get", { pane_id: paneId })).pane)
+        .not.toMatchObject({ agent: "jcode-lead" });
+      seat.runtime = "jcode-lead";
+      await relay.sweep();
+      expect((await transport.request("pane.get", { pane_id: paneId })).pane)
+        .toMatchObject({ agent: "jcode-lead" });
+      relay.stop();
       await run("tmux", ["-S", tmuxSocket, "detach-client", "-s", `=${session}`], { env });
+      relay = newRelay();
       await relay.sweep();
       const listed = await transport.request("pane.list", {});
       expect((listed.panes as Array<{ agent?: string }>).some(pane => pane.agent === "jcode-lead")).toBe(false);
-      console.log("Native Herdr proof: working, idle, blocked, unknown and detach clearing passed on private sockets.");
+      console.log("Native Herdr proof: working, idle, blocked, unknown, restart-to-built-in and restart-detach clearing passed on private sockets.");
     } finally {
       relay?.stop();
       await transport.request("server.stop", {}).catch(() => {});
