@@ -1324,14 +1324,14 @@ export class SeatHandoverService {
         : refuse(`The seat's latest session doesn't record community harness "${runtime}", so no adapter is selected for it and a successor can't be launched.`,
           "A runtime name alone never selects a community preset. Inspect the seat with: rig seat status <seat>");
     }
-    if (!(adapter instanceof CommunityHarnessRuntimeAdapter)) return null;
-    if (mode === "fork") {
-      const unsupported = adapter.forkUnsupported();
-      if (unsupported) return refuse(unsupported, "Use --source fresh or --source rebuild for this seat.");
+    if (adapter instanceof CommunityHarnessRuntimeAdapter) {
+      const unsupported = adapter.handoverUnsupported() ?? (mode === "fork" ? adapter.forkUnsupported() : null);
+      if (unsupported) return refuse(unsupported, "Keep the current occupant running. Inspect the seat with: rig seat status <seat>");
     }
+    if (!isCommunityHarnessRuntime(node.runtime) || !adapter.preflightLaunch) return null;
     try {
       const launchWrapper = isLaunchWrapperRuntime(node.runtime) ? readSeatLaunchWrapper(this.db, node.id) : undefined;
-      const checked = await adapter.preflightLaunch({ ...(launchWrapper?.length ? { launchWrapper } : {}) } as Parameters<CommunityHarnessRuntimeAdapter["preflightLaunch"]>[0]);
+      const checked = await adapter.preflightLaunch({ ...(launchWrapper?.length ? { launchWrapper } : {}) } as Parameters<NonNullable<RuntimeAdapter["preflightLaunch"]>>[0]);
       if (!checked.ok) return refuse(checked.error, `Repair the preset or the seat's launch settings for "${runtime}", then retry the handover.`);
     } catch (error) {
       return refuse(`The launch check for community harness "${runtime}" failed: ${error instanceof Error ? error.message : String(error)}.`,

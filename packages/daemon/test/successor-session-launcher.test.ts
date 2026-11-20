@@ -4,7 +4,7 @@ import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { SuccessorSessionLauncher } from "../src/domain/successor-session-launcher.js";
-import { withCommunityHarnessResolver } from "../src/adapters/community-harness-runtime-adapter.js";
+import { CommunityHarnessRuntimeAdapter, withCommunityHarnessResolver } from "../src/adapters/community-harness-runtime-adapter.js";
 import { resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
@@ -143,6 +143,31 @@ describe("SuccessorSessionLauncher", () => {
     } finally {
       fs.rmSync(presetsDir, { recursive: true, force: true });
     }
+  });
+
+  it("refuses direct contained successor creation before touching the viewer or guest", async () => {
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+      getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const containedLaunch = vi.fn();
+    const adapter = new CommunityHarnessRuntimeAdapter("openshell-claude", {
+      tmux, environmentStartup: { launch: containedLaunch } as never,
+    });
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, {
+      runtimeAdapters: { "openshell-claude": adapter },
+    });
+    const onReplacementStarted = vi.fn();
+    const result = await subject.createSuccessor({
+      node: { id: "node-1", runtime: "openshell-claude", communityHarness: "openshell-claude", cwd: "/w" },
+      departingSessionName: "dev-impl@rig", onReplacementStarted,
+    });
+    expect(result).toMatchObject({ ok: false, code: "successor_runtime_unsupported", replacementStarted: false,
+      message: expect.stringContaining("OpenShell handover is unsupported") });
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(setRemainOnExit).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    expect(containedLaunch).not.toHaveBeenCalled();
+    expect(onReplacementStarted).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("leaves the predecessor untouched when launch preflight refuses or throws (throws: %s)", async throws => {

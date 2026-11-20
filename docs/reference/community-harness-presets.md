@@ -36,6 +36,11 @@ the harness's default one: the example launchers keep one per seat under `$OPENR
 back, the problem is in the harness's own setup, such as its model, provider or login, and relaunching an OpenRig seat won't fix it. Fix
 it in the harness, then connect it.
 
+Hosted Pi-protocol presets reject unsupported launch wrappers before handover cutover.
+The contained `openshell-claude` runtime refuses fresh, rebuild and fork handover until guest
+checkpoint/recreation cutover is implemented. Replacing only its host viewer cannot safely start
+a new guest generation. Normal contained launch and resume are unchanged.
+
 ## The preset
 
 One YAML file per harness: `$OPENRIG_HOME/community-harnesses/<name>.yaml`. `rig community-harness list` shows what's

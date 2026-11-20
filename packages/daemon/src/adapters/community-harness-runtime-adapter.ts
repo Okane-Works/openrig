@@ -60,7 +60,7 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
   /** What `launchHarness` would refuse from the preset and the seat alone, checked while the predecessor still runs: a
    *  preset that is missing or unusable now, and a seat launch wrapper the launch can't apply. The same conditions, in
    *  the same order, as the launch; a seat with no launch wrapper is never refused for its preset's runner. */
-  async preflightLaunch(binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+  async preflightLaunch(binding: NodeBinding): Promise<{ ok: true; warnings?: string[] } | { ok: false; error: string }> {
     if (this.runtime === "openshell-claude") {
       return binding.launchWrapper?.length ? { ok: false, error: "launch_wrapper unavailable; no agent started." } : { ok: true };
     }
@@ -77,6 +77,14 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
       }
     }
     return { ok: true };
+  }
+
+  /** Contained compute needs a checkpoint/recreation transition before a new generation can launch.
+   * Handover currently only replaces the host viewer, so refuse without disrupting its guest. */
+  handoverUnsupported(): string | null {
+    return this.runtime === "openshell-claude"
+      ? "OpenShell handover is unsupported until guest lifecycle cutover is implemented; the existing viewer and guest were left running."
+      : null;
   }
 
   /** Why this harness can't start as a fork of another conversation, or null where its launch takes a fork source. */

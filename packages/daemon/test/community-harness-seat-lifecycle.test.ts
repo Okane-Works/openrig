@@ -513,6 +513,30 @@ describe("a community harness's seat keeps its harness when its session row is r
       expect(relaunchAdapter(node.id, map)).toBeInstanceOf(CommunityHarnessRuntimeAdapter);
     });
 
+    it.each(["fresh", "rebuild", `fork:${SEAT}`])("refuses contained OpenShell %s handover without touching viewer or guest", async source => {
+      seedSeat("openshell-claude", { launchedFor: "openshell-claude" });
+      const containedLaunch = vi.fn();
+      const adapter = new CommunityHarnessRuntimeAdapter("openshell-claude", {
+        tmux: {} as TmuxAdapter,
+        environmentStartup: { launch: containedLaunch } as never,
+      });
+      // Normal contained startup remains available. Only the unsupported handover transition is blocked.
+      expect(await adapter.preflightLaunch({} as NodeBinding)).toEqual({ ok: true });
+      const result = await refusedBothWays(handoverService({ "openshell-claude": adapter }), source);
+      expect(result.message).toContain("OpenShell handover is unsupported");
+      expect(containedLaunch).not.toHaveBeenCalled();
+    });
+
+    it.each(["fresh", "rebuild"])("refuses wrapped hosted Pi %s handover before cutover", async source => {
+      const adapter = hostedPiAdapter("/state/conversation.jsonl");
+      const { node } = seedSeat("future-pi", { launchedFor: "future-pi" });
+      db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?")
+        .run(JSON.stringify(["/usr/bin/env"]), node.id);
+      const result = await refusedBothWays(handoverService({ "future-pi": adapter }), source);
+      expect(result.message).toContain("launch_wrapper support unavailable");
+      expect(adapter.launchHarness).not.toHaveBeenCalled();
+    });
+
     function hostedPiAdapter(token: string, resumeType = "community:future-pi"): PiCommunityRuntimeAdapter {
       installPreset("future-pi", "protocol: pi-rpc\n");
       const found = loadCommunityHarnessPreset("future-pi", presets);

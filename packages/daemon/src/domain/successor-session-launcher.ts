@@ -6,7 +6,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { RuntimeHint } from "./discovery-types.js";
 import type { RuntimeAdapter, NodeBinding, ReadinessResult, ForkSource } from "./runtime-adapter.js";
-import { communityLaunchRunner, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
+import { CommunityHarnessRuntimeAdapter, communityLaunchRunner, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { isAttentionRequiredReadinessCode } from "./runtime-adapter.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
@@ -286,6 +286,11 @@ export class SuccessorSessionLauncher {
     }
     if (!adapter) {
       return { ok: false, code: "successor_runtime_unsupported", step: "create_successor", message: `No runtime adapter for "${input.node.runtime ?? "unknown"}"; the incumbent was left running.`, replacementStarted: false };
+    }
+    if (adapter instanceof CommunityHarnessRuntimeAdapter) {
+      const unsupported = adapter.handoverUnsupported();
+      if (unsupported) return { ok: false, code: "successor_runtime_unsupported", step: "create_successor",
+        message: unsupported, replacementStarted: false };
     }
     let preflightWarnings: string[] = [];
     if (adapter.preflightLaunch) {
