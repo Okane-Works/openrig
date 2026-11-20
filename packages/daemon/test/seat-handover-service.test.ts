@@ -705,15 +705,15 @@ describe("SeatHandoverService", () => {
     expect(result.ok && "plan" in result && result.plan.willMutate).toBe(false);
     expect(durableRows()).toBe(before);
   });
-  it("reports a missing community runtime adapter in dry-run without touching the incumbent", async () => {
+  it("refuses a community seat with no resolved adapter in the dry run, as the real run does, without touching the incumbent", async () => {
     const { node, sessionId } = seedSeat({ runtime: "jcode" });
     db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run("jcode", sessionId);
     service = newService(tmux(), undefined, "jcode", {});
     const before = durableRows();
     const bindingBefore = sessionRegistry.getBindingForNode(node.id);
     const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", dryRun: true });
-    expect(result).toMatchObject({ ok: true, plan: { willMutate: false, runtimeAdapter: {
-      status: "unsupported", detail: expect.stringContaining("jcode") } } });
+    expect(result).toMatchObject({ ok: false, code: "successor_runtime_unsupported", message: expect.stringContaining("jcode") });
+    expect(await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall" })).toEqual(result);
     expect(signalPaneProcess).not.toHaveBeenCalled();
     expect(respawnPane).not.toHaveBeenCalled();
     expect(sessionRegistry.getBindingForNode(node.id)).toEqual(bindingBefore);

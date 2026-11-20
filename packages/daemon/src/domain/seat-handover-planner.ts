@@ -28,10 +28,12 @@ export interface SeatHandoverPlan {
   ok: true;
   dryRun: true;
   willMutate: false;
-runtimeAdapter?: {
-status: "unsupported" | "resolved_unverified";
-detail: string;
-};
+  /** Set when the plan's source launches a successor: the seat's runtime adapter resolved, which a real run checks the
+   *  same way before it changes anything. A seat whose adapter doesn't resolve gets a refusal, not a plan. */
+  runtimeAdapter?: {
+    status: "resolved_unverified";
+    detail: string;
+  };
   seat: {
     ref: string;
     rigId: string;

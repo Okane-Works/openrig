@@ -6,7 +6,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { RuntimeHint } from "./discovery-types.js";
 import type { RuntimeAdapter, NodeBinding, ReadinessResult, ForkSource } from "./runtime-adapter.js";
-import { seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
+import { communityLaunchRunner, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { isAttentionRequiredReadinessCode } from "./runtime-adapter.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
@@ -103,6 +103,11 @@ export type SuccessorLaunchResult =
       tmuxPane: string;
       resumeToken?: string;
       resumeType?: string;
+      /** Where resumeToken came from when it isn't a pane scrape: a community harness's launcher reported it, or OpenRig
+       *  named the conversation and passed it. Neither is a verification. */
+      resumeProvenance?: "launcher" | "passed";
+      /** A community harness's successor: what this launch's preset declared as its runner, recorded with the session. */
+      communityRunner?: boolean | "pi-rpc";
       appliedLaunch?: AppliedLaunchObservation;
       /** The launch's frozen executable and whether it is a #! script (Claude managed launches, #2341). */
       launchedExecutable?: { path: string; isScript: boolean };
@@ -385,6 +390,8 @@ export class SuccessorSessionLauncher {
       tmuxPane: pane.id,
       resumeToken: started.resumeToken,
       resumeType: started.resumeType,
+      ...(started.resumeToken && started.resumeProvenance ? { resumeProvenance: started.resumeProvenance } : {}),
+      ...(started.communityRunner !== undefined ? { communityRunner: started.communityRunner } : {}),
       appliedLaunch: started.appliedLaunch,
       ...(started.launchedExecutable ? { launchedExecutable: started.launchedExecutable } : {}),
       ...(started.activityGrantId ? { activityGrantId: started.activityGrantId } : {}),
@@ -472,7 +479,7 @@ export class SuccessorSessionLauncher {
     staged?: StagedLaunch,
     preparedBinding?: NodeBinding,
     resolvedAdapter?: RuntimeAdapter,
-  ): Promise<{ ok: true; activityGrantId?: string; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; notes?: string[]; launchedExecutable?: { path: string; isScript: boolean } }
+  ): Promise<{ ok: true; activityGrantId?: string; resumeToken?: string; resumeType?: string; resumeProvenance?: "launcher" | "passed"; communityRunner?: boolean | "pi-rpc"; appliedLaunch?: AppliedLaunchObservation; notes?: string[]; launchedExecutable?: { path: string; isScript: boolean } }
     | { ok: false; code: string; message: string; launched?: true; resumeToken?: string; resumeType?: string; appliedLaunch?: AppliedLaunchObservation; launchedExecutable?: { path: string; isScript: boolean } }> {
     const adapter = resolvedAdapter ?? seatAdapter(this.runtimeAdapters, node.runtime, node.communityHarness);
     if (!adapter) {
@@ -563,7 +570,10 @@ export class SuccessorSessionLauncher {
       };
     }
 
-    return { ok: true, resumeToken, resumeType, ...(launch.activityGrantId ? { activityGrantId: launch.activityGrantId } : {}), appliedLaunch: launch.appliedLaunch, ...launchedExecutable, ...(notes?.length ? { notes } : {}) };
+    // Sampled with this launch, as a launch records it: a later preset edit doesn't change what this occupant was started as.
+    const communityRunner = communityLaunchRunner(adapter);
+    return { ok: true, resumeToken, resumeType, ...(resumeToken && launch.resumeProvenance ? { resumeProvenance: launch.resumeProvenance } : {}),
+      ...(communityRunner !== undefined ? { communityRunner } : {}), ...(launch.activityGrantId ? { activityGrantId: launch.activityGrantId } : {}), appliedLaunch: launch.appliedLaunch, ...launchedExecutable, ...(notes?.length ? { notes } : {}) };
   }
 
   /**

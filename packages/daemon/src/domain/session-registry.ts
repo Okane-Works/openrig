@@ -7,6 +7,7 @@ const ulid = monotonicFactory();
 import type { Session, Binding } from "./types.js";
 import { boundSessionNameProblem, validateSessionName } from "./session-name.js";
 import { formatWatchdogRegistrationError } from "./watchdog-auto-registration.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
 import type { ClaudeLaunchedProcess, ClaudeResumeRotation } from "./native-process-lineage.js";
 
 // GHOST-STAGE atom-B (P12 3548d8eb) — the occupant-generation tenure.
@@ -324,20 +325,53 @@ export class SessionRegistry {
     try { this.db.prepare("UPDATE sessions SET launched_cwd = ? WHERE id = ?").run(cwd, sessionId); } catch { /* no column */ }
   }
 
-  /** Register a claimed session — skips naming validation, sets origin='claimed', startup_status='ready'. */
+  /** The community harness a seat's next session row keeps: the one its latest session row was launched for, while that
+   *  is still the node's runtime. Null for a seat with no session, one whose latest session recorded none (a free-text
+   *  runtime name is never promoted here), or one whose runtime changed since. */
+  priorCommunityHarness(nodeId: string): string | null {
+    if (sessionCommunityHarnessSelect(this.db, "sessions") === "NULL") return null;
+    const prior = this.db.prepare("SELECT agent_app FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
+      .get(nodeId) as { agent_app: string | null } | undefined;
+    if (!prior?.agent_app) return null;
+    const node = this.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(nodeId) as { runtime: string | null } | undefined;
+    return communityHarnessOf(prior.agent_app, node?.runtime);
+  }
+
+  /** Register a claimed session — skips naming validation, sets origin='claimed', startup_status='ready'.
+   *
+   *  A claimed session is a new occupant, and by default it records no community harness: a different occupant of the
+   *  seat (a person's shell joined with attach --self, a bound discovered session) is not classified as the harness the
+   *  seat was once launched for. `keepCommunityHarness` is for the two callers where the seat itself continues: a
+   *  reconcile of the seat's own session, and a handover that launches the successor through the preset. With it, a seat
+   *  whose latest session was launched for a community harness keeps that selection on the new row
+   *  (`priorCommunityHarness`), so the seat still resolves its harness's adapter. That is the seat's launch provenance,
+   *  not a statement about the pane: the row records no runner (a caller that launched one records it) and no resume
+   *  token. The previous conversation is never copied, since nothing here observes which conversation the pane holds. */
   registerClaimedSession(
     nodeId: string,
     sessionName: string,
     kind: OccupantKind = "adopt",
     reservedGeneration?: string | null,
+    opts?: { keepCommunityHarness?: boolean },
   ): Session {
     this.assertAddressAvailable(nodeId, sessionName, this.getBindingForNode(nodeId)?.attachmentType !== "external_cli");
+    const communityHarness = opts?.keepCommunityHarness ? this.priorCommunityHarness(nodeId) : null;
     const id = ulid();
-    this.db
-      .prepare(
-        "INSERT INTO sessions (id, node_id, session_name, status, origin, startup_status) VALUES (?, ?, ?, 'running', 'claimed', 'ready')"
-      )
-      .run(id, nodeId, sessionName);
+    if (communityHarness) {
+      // One statement, so the row never exists without its harness, whatever transaction the caller holds.
+      const runner = sessionCommunityRunnerSelect(this.db, "sessions") !== "NULL";
+      this.db
+        .prepare(
+          `INSERT INTO sessions (id, node_id, session_name, status, origin, startup_status, agent_app${runner ? ", agent_runner" : ""}) VALUES (?, ?, ?, 'running', 'claimed', 'ready', ?${runner ? ", 0" : ""})`
+        )
+        .run(id, nodeId, sessionName, communityHarness);
+    } else {
+      this.db
+        .prepare(
+          "INSERT INTO sessions (id, node_id, session_name, status, origin, startup_status) VALUES (?, ?, ?, 'running', 'claimed', 'ready')"
+        )
+        .run(id, nodeId, sessionName);
+    }
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
     try { new ActivityGrantStore(this.db).reconcileBinding(nodeId); }

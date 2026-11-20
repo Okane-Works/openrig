@@ -57,12 +57,27 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
 
   get environment() { return this.runtime === "openshell-claude" ? this.deps.environmentStartup?.platform : undefined; }
 
-  async preflightLaunch(_binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+  /** What `launchHarness` would refuse from the preset and the seat alone, checked while the predecessor still runs: a
+   *  preset that is missing or unusable now, and a seat launch wrapper the launch can't apply. The same conditions, in
+   *  the same order, as the launch; a seat with no launch wrapper is never refused for its preset's runner. */
+  async preflightLaunch(binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (this.runtime === "openshell-claude") {
+      return binding.launchWrapper?.length ? { ok: false, error: "launch_wrapper unavailable; no agent started." } : { ok: true };
+    }
     const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
     if (!found.ok) return { ok: false, error: found.message };
-    if (found.preset.runner && !found.preset.launchWrapper)
-      return { ok: false, error: unsupportedCommunityRunnerLaunchWrapperMessage(this.runtime) };
+    if (binding.launchWrapper?.length) {
+      if (!this.deps.seatLaunchEnvironment) return { ok: false, error: "launch_wrapper unavailable; no agent started." };
+      if (found.preset.runner && !found.preset.launchWrapper)
+        return { ok: false, error: unsupportedCommunityRunnerLaunchWrapperMessage(this.runtime) };
+    }
     return { ok: true };
+  }
+
+  /** Why this harness can't start as a fork of another conversation, or null where its launch takes a fork source. */
+  forkUnsupported(): string | null {
+    return this.runtime === "openshell-claude" ? null
+      : `Fork is unsupported: community harness "${this.runtime}" is launch-only.`;
   }
 
   private contained(): EnvironmentStartup | undefined {
@@ -381,6 +396,13 @@ export function withCommunityHarnessResolver<T extends Record<string, RuntimeAda
       ? createCommunityHarnessAdapter(runtime, deps, piAdapter) : undefined,
   });
   return builtIns;
+}
+
+/** What a launch through this adapter records as the session's runner (`recordCommunityHarnessSelection`): the preset's
+ *  own declaration, OpenRig's hosted Pi-protocol runner, or undefined for an adapter that isn't a community harness's. */
+export function communityLaunchRunner(adapter: RuntimeAdapter): boolean | "pi-rpc" | undefined {
+  if (adapter instanceof PiCommunityRuntimeAdapter) return "pi-rpc";
+  return adapter instanceof CommunityHarnessRuntimeAdapter ? adapter.runner() : undefined;
 }
 
 /** The adapter to relaunch a seat with: its runtime's built-in adapter, or, for a seat launched for a community

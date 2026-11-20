@@ -19,6 +19,7 @@ import {
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
 import { SessionTransport, type SendResult } from "./session-transport.js";
+import { isShellForeground } from "./shell-classifier.js";
 
 /** Describe a failed identity-hint send by what the transport positively reported about the seat's input. Only
  *  `inputPhase: "not_reached"` establishes that nothing was written; an `attempted` write may have landed, a `written`
@@ -393,7 +394,9 @@ export class ClaimService {
     );
 
     const bindTx = this.db.transaction(() => {
-      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession);
+      // A discovered session bound to an existing seat takes the seat over as it is, harness included: the bind above
+      // already refused a session whose runtime is known to differ from the seat's.
+      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession, "adopt", undefined, { keepCommunityHarness: true });
       this.persistPaneBinding(
         node.id,
         discovered.tmuxSession,
@@ -581,6 +584,25 @@ export class ClaimService {
         paneObservation.ok ? paneObservation.pane : sessionName,
       );
     } catch { paneCommand = null; }
+    // A seat whose latest session was launched for a community harness keeps that harness on the row registered below
+    // (registerClaimedSession). That says what the seat was launched for, not what the pane runs: no community harness's
+    // process or conversation is identified here.
+    const communityHarness = this.sessionRegistry.priorCommunityHarness(nodeRow.id);
+    if (communityHarness && paneCommand) {
+      const pane = paneObservation.ok ? paneObservation.pane : sessionName;
+      // The pane's foreground process is positively another runtime's. Reconcile stays a re-link that reports what it
+      // couldn't prove: the seat keeps its harness (its launch provenance), no conversation is recorded, and the
+      // mismatch is named as drift. openshell-claude runs Claude by design, so it is not judged this way.
+      const foreign = communityHarness === "openshell-claude" ? null
+        : paneCommand === "claude" && await this.runtimeProvenInPane("claude-code", pane) ? "claude-code"
+        : paneCommand === "codex" && await this.runtimeProvenInPane("codex", pane) ? "codex" : null;
+      if (foreign) {
+        projectionDrift.push(`runtime mismatch: the pane is running ${foreign}, but this seat was launched for community harness "${communityHarness}"; the seat keeps "${communityHarness}" and nothing was recorded about the ${foreign} process`);
+      }
+      if (isShellForeground(paneCommand)) {
+        projectionDrift.push(`runtime unverified: the pane is at a shell ("${paneCommand}"), so community harness "${communityHarness}" isn't shown to be running`);
+      }
+    }
     if (nodeRow.runtime) {
       const expectation: Record<string, string[]> = {
         "claude-code": ["claude", "node"],
@@ -613,7 +635,8 @@ export class ClaimService {
         for (const row of stale) {
           this.sessionRegistry.markSuperseded(row.id);
         }
-        const session = this.sessionRegistry.registerClaimedSession(nodeRow!.id, sessionName);
+        // The seat's own canonical session, re-linked: the seat continues, so it keeps the harness it was launched for.
+        const session = this.sessionRegistry.registerClaimedSession(nodeRow!.id, sessionName, "adopt", undefined, { keepCommunityHarness: true });
         this.persistPaneBinding(nodeRow!.id, sessionName, paneObservation, session.id);
         sessionId = session.id;
         persistedEvent = this.eventBus.persistWithinTransaction({
@@ -662,7 +685,16 @@ export class ClaimService {
         } catch { /* Reporting cannot turn an already committed binding into failure. */ }
       }
       const resumeMetadata: ReconcileResumeMetadata = { capture, status };
-      if (status === "missing" || status === "unknown") {
+      if (communityHarness) {
+        // Nothing identifies which conversation a community harness's pane holds now: the command a process was started
+        // with can name a conversation it has since left. So the previous session's conversation is not copied.
+        resumeMetadata.status = "missing";
+        resumeMetadata.guidance = `The seat is bound and keeps community harness "${communityHarness}", so it can be launched again. `
+          + "No conversation is recorded for this session: the previous one was not copied, because the conversation the live pane holds can't be confirmed. "
+          + "A restore of this seat stops and asks. To start a new recorded conversation, release this adopted session first: "
+          + `rig unclaim ${shellQuote(sessionName)}, end the harness process and its tmux session, then rig seat launch ${shellQuote(sessionName)} --fresh. `
+          + "A fresh launch is refused while the adopted session is still claimed.";
+      } else if (status === "missing" || status === "unknown") {
         resumeMetadata.guidance = `The seat is bound, but future resume metadata is ${status === "missing" ? "missing" : "unconfirmed"}. ` +
           `After confirming the live conversation identity, pipe its verified token to rig seat set-resume-token ${shellQuote(sessionName)} --token-stdin --reason "verified live conversation". ` +
           "The token must come from stdin, never a command argument. No prior token was copied.";
