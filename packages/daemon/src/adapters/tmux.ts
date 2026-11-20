@@ -3207,6 +3207,29 @@ export class TmuxAdapter {
     }
   }
 
+  /** Client processes on this daemon's server. Viewers are attributed by PID, not by pane labels. */
+  async listClientProcesses(): Promise<Array<{ pid: number; session: string }>> {
+    const format = `#{client_pid}${TMUX_FIELD_SEPARATOR}#{client_session}`;
+    try {
+      const output = await this.run(["tmux", "list-clients", "-F", format],
+        `tmux list-clients -F "${format}"`);
+      return output.split("\n").filter(line => line.length > 0).map(line => {
+        const separator = line.indexOf(TMUX_FIELD_SEPARATOR);
+        const rawPid = line.slice(0, Math.max(separator, 0));
+        const pid = Number(rawPid);
+        const session = line.slice(separator + TMUX_FIELD_SEPARATOR.length);
+        if (separator < 1 || !/^\d+$/.test(rawPid) || !Number.isSafeInteger(pid) || pid <= 0 || !session) {
+          // An incomplete snapshot must not look like viewers detached.
+          throw new Error("Malformed tmux client process inventory");
+        }
+        return { pid, session };
+      });
+    } catch (err) {
+      if (isNoServerError(err) || isTmuxTransportAbsentError(err)) return [];
+      throw err;
+    }
+  }
+
   /** The clients attached to a session: each one's terminal device and the terminal type it reported (XTVERSION,
    *  "" when it reported none). Empty when the session has no clients, or when the session or the server is gone;
    *  null when tmux can't be read. */

@@ -461,6 +461,7 @@ export async function startServer(port?: number) {
       ["wake-recovery", () => wakeRecovery.stop()],
       ["terminal-following", () => deps.terminalService?.stop()],
       ["rex-status", () => deps.rexStatusRelay?.stop()],
+      ["herdr-status", () => deps.herdrStatusRelay?.stop()],
       ["timers", () => {
         deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);

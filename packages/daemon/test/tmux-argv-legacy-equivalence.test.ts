@@ -158,6 +158,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readAllPaneProcesses();
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
+  await a.listClientProcesses();
   await a.listSessionClientTerminals(SESSION);
   await a.lastClientActivity(SESSION);  // #3076: the client activity read right before an automatic paste
   await a.switchClient("/dev/ttys001", SESSION);

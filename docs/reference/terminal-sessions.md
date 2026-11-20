@@ -19,6 +19,41 @@ also names the session and returns its resolved control socket in `status.launch
 Session names are a single non-empty name, such as `future-prod`, rather than a
 socket path. `--session default` explicitly selects Herdr's default session.
 
+## Community-harness activity indicators
+
+Herdr viewer panes for community harnesses, including Jcode and role variants
+such as `jcode-lead`, show the activity OpenRig resolves for their seats:
+
+| OpenRig activity | Herdr indicator state |
+| --- | --- |
+| Running | `working` |
+| Idle at the prompt | `idle` |
+| Needs input or approval | `blocked` |
+| No current activity evidence | `unknown` |
+
+Herdr may present an unfocused working-to-idle transition as `done` until
+you view it. That unseen-completion behavior, notifications, and workspace
+rollups are Herdr's own, not additional activity states invented by OpenRig.
+
+The daemon matches each viewer's foreground process to a client on its own
+tmux server. Pane titles and labels are not identities. Existing viewers on
+the daemon's configured Herdr endpoint are discovered automatically. Named
+endpoints are monitored after selecting them with `--session` during that
+daemon's lifetime. More than one viewer of a seat can receive its status.
+
+Activity changes are relayed in the background. A five-second sweep discovers
+new viewers and retries failed reports. Unchanged status is refreshed every
+30 seconds so a Herdr restart does not leave a viewer without its indicator.
+An unavailable Herdr endpoint never blocks the agent or changes seat activity.
+This does not launch or restart seats, alter their resume commands, or install
+hooks inside a harness. The community runner still needs to report activity
+through OpenRig's activity contract.
+
+Claude Code, Codex, Pi, and other built-in runtimes keep their existing Herdr
+integration. This relay handles local tmux viewers, not remote SSH tiles or
+the separate `herdr-app` provider. Herdr chooses the indicator colors and
+glyphs. The report API exposes no separate error/red state.
+
 ## Default selection and scope
 
 When Herdr is selected with no `--session`, the daemon uses the endpoint selected when it started:

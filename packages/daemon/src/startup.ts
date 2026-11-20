@@ -718,6 +718,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // the attention reconciler exists, so a reading before then waits for the next change.
   let restoredSeatActivity: ((sessionName: string, state: string | undefined) => void) | undefined;
   let rexSeatActivity: ((sessionName: string, current: import("./domain/terminal/rex-agent-status.js").SeatActivity) => void) | undefined;
+  let herdrSeatActivity: (() => void) | undefined;
   const currentSeatActivity = (sessionName: string) => {
     const runtime = sessionRegistry.findResumeContextByName(sessionName)?.runtime ?? null;
     const structural = seatStructuralActivityService.getStructuralActivity(sessionName);
@@ -735,6 +736,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       .catch(error => console.warn(`Reachable-seat wake recovery: ${error instanceof Error ? error.name : typeof error}`));
     restoredSeatActivity?.(sessionName, state);
     rexSeatActivity?.(sessionName, { activity, runtime });
+    herdrSeatActivity?.();
   };
   seatStructuralActivityService.attachActivityChanged(retryPromptWakes);
   eventBus.subscribe(event => { if (event.type === "agent.activity") retryPromptWakes(event.sessionName); });
@@ -2313,12 +2315,19 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logicalId: e.logicalId,
     });
 
-    const { defaultProvider: herdrProvider, sessionProvider: herdrSessionProvider } = createHerdrProviders(process.env, async target => {
+    const { defaultProvider: herdrProvider, sessionProvider: herdrSessionProvider, statusTransports } = createHerdrProviders(process.env, async target => {
       // Read-only native input observation. Never persist the captured text.
       const session = target.attachArgv?.[4];
       if (!session) return "unknown";
       return inspectComposerInput(await tmuxAdapter.captureComposerSnapshot(session), target.runtime ?? null).state;
     });
+    const { HerdrAgentStatusRelay } = await import("./domain/terminal/herdr-agent-status.js");
+    const herdrStatusRelay = new HerdrAgentStatusRelay({
+      clients: tmuxAdapter, resolve: currentSeatActivity, transports: statusTransports,
+    });
+    herdrSeatActivity = () => { void herdrStatusRelay.activityChanged(); };
+    deps.herdrStatusRelay = herdrStatusRelay;
+    herdrStatusRelay.start();
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
       // One gridded workspace per composed page — the same grid machinery as
