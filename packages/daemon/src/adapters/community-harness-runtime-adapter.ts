@@ -70,6 +70,11 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
       if (!this.deps.seatLaunchEnvironment) return { ok: false, error: "launch_wrapper unavailable; no agent started." };
       if (found.preset.runner && !found.preset.launchWrapper)
         return { ok: false, error: unsupportedCommunityRunnerLaunchWrapperMessage(this.runtime) };
+      try {
+        this.deps.seatLaunchEnvironment.resolveLaunchWrapper(binding.launchWrapper);
+      } catch {
+        return { ok: false, error: "launch_wrapper unavailable; no agent started." };
+      }
     }
     return { ok: true };
   }
