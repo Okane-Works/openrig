@@ -120,7 +120,7 @@ describe("SeatHandoverService", () => {
     return { runtime: "codex", launchHarness, checkReady } as unknown as RuntimeAdapter;
   }
 
-  function newService(adapter: TmuxAdapter = tmux(), occupantInvalidator: OccupantInvalidator = { invalidateRetiringOccupant }, runtime = "codex"): SeatHandoverService {
+  function newService(adapter: TmuxAdapter = tmux(), occupantInvalidator: OccupantInvalidator = { invalidateRetiringOccupant }, runtime = "codex", runtimeAdapters?: Record<string, RuntimeAdapter>): SeatHandoverService {
     return new SeatHandoverService({
       codexPermissions: { currentCodexPermissions },
       db,
@@ -131,7 +131,7 @@ describe("SeatHandoverService", () => {
       tmuxAdapter: adapter,
       now: () => new Date("2026-04-24T18:30:00.000Z"),
       newSuccessorId: () => "01SUCCID0",
-      runtimeAdapters: { [runtime]: { ...codexAdapter(), runtime } },
+      runtimeAdapters: runtimeAdapters ?? { [runtime]: { ...codexAdapter(), runtime } },
       contextUsageStore: { readSidecar } as never,
       resumeTokenCapturer: { captureCodexThreadId, captureClaudeSessionId } as never,
       ...(claudeProcessStartedAt ? { claudeProcessStartedAt } : {}),
@@ -703,6 +703,20 @@ describe("SeatHandoverService", () => {
 
     expect(result.ok).toBe(true);
     expect(result.ok && "plan" in result && result.plan.willMutate).toBe(false);
+    expect(durableRows()).toBe(before);
+  });
+  it("refuses a community seat with no resolved adapter in the dry run, as the real run does, without touching the incumbent", async () => {
+    const { node, sessionId } = seedSeat({ runtime: "jcode" });
+    db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run("jcode", sessionId);
+    service = newService(tmux(), undefined, "jcode", {});
+    const before = durableRows();
+    const bindingBefore = sessionRegistry.getBindingForNode(node.id);
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", dryRun: true });
+    expect(result).toMatchObject({ ok: false, code: "successor_runtime_unsupported", message: expect.stringContaining("jcode") });
+    expect(await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall" })).toEqual(result);
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(sessionRegistry.getBindingForNode(node.id)).toEqual(bindingBefore);
     expect(durableRows()).toBe(before);
   });
 

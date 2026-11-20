@@ -23,6 +23,8 @@ it never reads an unsupported capability as idle, working, ready or verified.
 | Approval | no | Approvals stay in the harness's own pane. OpenRig relays none, so a person answers them there. A [runner preset](#runner-presets-runner-true) is the exception: its runner submits the agent's permission requests to OpenRig, which asks a person, and the default is permit (section 7 of the [harness and runner contract](harness-runner-contract.md)). |
 | Cancel | no | A plain preset has no live native cancellation consumer. Its own manual controls remain available; `/abort` is ordinary input unless that program defines it. An implemented runner can support the [named native command](harness-runner-contract.md#optional-run-bound-native-input-and-wake-version-1), subject to its own capability and turn mapping. `rig seat stop` and `rig down` end the seat's tmux session; work outside that pane, such as a gateway, has separate custody and lifecycle. List those limits in the preset. Restarting in place and switching harness are refused. |
 | Transport | yes | The seat is a tmux pane like any other, so `rig capture`, `rig send` and `--host` work as they do for any seat. |
+| Handover | yes | `rig handover` launches the successor through the preset and records its harness, its runner declaration and the conversation that launch named. A preset that is missing or unusable, or a fork (a plain preset is launch-only), is refused before the current occupant is stopped, and `--dry-run` returns the same refusal (`successor_runtime_unsupported`). The dry run doesn't start the harness, so it can't say whether the successor becomes ready. |
+| Re-link | yes | `rig reconcile-session` and a bind keep the harness on a seat that was launched for it, so the seat can still be launched and restored. `rig attach --self` joins a different occupant, which isn't classified as the harness. None of them records a conversation: OpenRig can't observe which conversation the pane holds, and a process started with a resume flag may have switched since. A restore of a re-linked seat stops and asks. To start a new recorded conversation, release the adopted session first (`rig unclaim <session>`), end the harness process and its tmux session, then run `rig seat launch <seat> --fresh`; a fresh launch is refused while the adopted session is still claimed. A seat that only names the harness as its runtime, without a launch for it, still gets no preset. |
 
 **Not placed:** guidance, skills and startup files (a launch warns that they weren't delivered), and the model: set it in the harness's own
 configuration, or let a launcher that opts in take the seat's declared model (`passes_model`, below).
@@ -33,6 +35,11 @@ the harness's default one: the example launchers keep one per seat under `$OPENR
 `OPENCLAW_STATE_DIR` or `CURSOR_CONFIG_DIR`), so a check with your own defaults can pass while the seat's setup fails. If no answer comes
 back, the problem is in the harness's own setup, such as its model, provider or login, and relaunching an OpenRig seat won't fix it. Fix
 it in the harness, then connect it.
+
+Hosted Pi-protocol presets reject unsupported launch wrappers before handover cutover.
+The contained `openshell-claude` runtime refuses fresh, rebuild and fork handover until guest
+checkpoint/recreation cutover is implemented. Replacing only its host viewer cannot safely start
+a new guest generation. Normal contained launch and resume are unchanged.
 
 ## The preset
 

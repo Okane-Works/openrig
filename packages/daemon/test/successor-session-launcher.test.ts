@@ -4,11 +4,15 @@ import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { SuccessorSessionLauncher } from "../src/domain/successor-session-launcher.js";
+import { CommunityHarnessRuntimeAdapter, withCommunityHarnessResolver } from "../src/adapters/community-harness-runtime-adapter.js";
 import { resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxOptionDefaultsApplier } from "../src/domain/tmux-option-defaults.js";
 import type { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 describe("SuccessorSessionLauncher", () => {
   let db: Database.Database;
@@ -103,6 +107,67 @@ describe("SuccessorSessionLauncher", () => {
     expect(setRemainOnExit).not.toHaveBeenCalled();
     expect(signalPaneProcess).not.toHaveBeenCalled();
     expect(respawnPane).not.toHaveBeenCalled();
+  });
+
+  it("leaves the incumbent untouched when the recorded community runtime has no resolved adapter", async () => {
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+      getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters: { codex: fakeAdapter("codex") } });
+    const result = await subject.createSuccessor({ node: { id: "node-1", runtime: "jcode", communityHarness: "jcode", cwd: "/w" },
+      departingSessionName: "dev-build@trading" });
+    expect(result).toMatchObject({ ok: false, code: "successor_runtime_unsupported", replacementStarted: false,
+      message: expect.stringContaining("incumbent was left running") });
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+  });
+
+  it("resolves the recorded community harness before cutover and launches it as successor", async () => {
+    const presetsDir = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-community-handover-"));
+    fs.writeFileSync(path.join(presetsDir, "jcode.yaml"), "format: 1\nname: jcode\ncommand: jcode\nmaintainer: test\nlimits: []\n");
+    const sendShellCommand = vi.fn(async () => ({ ok: true as const }));
+    const communityRuntimeMap = withCommunityHarnessResolver({ codex: fakeAdapter("codex") }, {
+      presetsDir: () => presetsDir,
+      tmux: { hasSession: async () => true, getPaneCommand: async () => "jcode", sendShellCommand },
+    });
+    try {
+      const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+        getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+      const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, { runtimeAdapters: communityRuntimeMap,
+        sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5 });
+      const result = await subject.createSuccessor({ node: { id: "node-1", runtime: "jcode", communityHarness: "jcode", cwd: "/w" },
+        departingSessionName: "dev-build@trading" });
+      expect(result.ok).toBe(true);
+      expect(sendShellCommand).toHaveBeenCalledTimes(1);
+      expect(signalPaneProcess).toHaveBeenCalledWith("%7", "TERM");
+    } finally {
+      fs.rmSync(presetsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses direct contained successor creation before touching the viewer or guest", async () => {
+    const tmux = { listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead,
+      getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const containedLaunch = vi.fn();
+    const adapter = new CommunityHarnessRuntimeAdapter("openshell-claude", {
+      tmux, environmentStartup: { launch: containedLaunch } as never,
+    });
+    const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, {
+      runtimeAdapters: { "openshell-claude": adapter },
+    });
+    const onReplacementStarted = vi.fn();
+    const result = await subject.createSuccessor({
+      node: { id: "node-1", runtime: "openshell-claude", communityHarness: "openshell-claude", cwd: "/w" },
+      departingSessionName: "dev-impl@rig", onReplacementStarted,
+    });
+    expect(result).toMatchObject({ ok: false, code: "successor_runtime_unsupported", replacementStarted: false,
+      message: expect.stringContaining("OpenShell handover is unsupported") });
+    expect(signalPaneProcess).not.toHaveBeenCalled();
+    expect(setRemainOnExit).not.toHaveBeenCalled();
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    expect(containedLaunch).not.toHaveBeenCalled();
+    expect(onReplacementStarted).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("leaves the predecessor untouched when launch preflight refuses or throws (throws: %s)", async throws => {
@@ -655,7 +720,7 @@ describe("SuccessorSessionLauncher", () => {
     const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
     const noAdapter = new SuccessorSessionLauncher(tmux, discoveryRepo, { newId: () => "01ABCDEFG", runtimeAdapters: {}, exitPollMs: 1, exitTimeoutMs: 5 });
     const res = await noAdapter.createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
-    expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_runtime_unsupported" });
+    expect(res).toMatchObject({ ok: false, step: "create_successor", code: "successor_runtime_unsupported" });
     expect(killSession).not.toHaveBeenCalled();
     expect(discoveryRepo.listDiscovered()).toHaveLength(0);
   });

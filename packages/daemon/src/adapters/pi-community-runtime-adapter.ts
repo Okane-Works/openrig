@@ -1,5 +1,6 @@
 import type { CommunityHarnessPreset } from "../domain/community-harness-presets.js";
 import { validateSessionFileFormat } from "../domain/resume-token-validation.js";
+import type { NodeBinding } from "../domain/runtime-adapter.js";
 import { PiRuntimeAdapter, type PiRuntimeAdapterDeps } from "./pi-runtime-adapter.js";
 
 /**
@@ -30,6 +31,14 @@ export class PiCommunityRuntimeAdapter extends PiRuntimeAdapter {
   /** Whether this launch's preset declares an OpenRig-aware runner, recorded on the session with the launch. */
   runner(): boolean {
     return true;
+  }
+
+  /** What `launchHarness` would refuse from the seat alone, checked while the predecessor still runs: a Pi fork
+   *  can't apply a seat launch wrapper, so a nonempty one is refused with the launch's own error. */
+  async preflightLaunch(binding: NodeBinding): Promise<{ ok: true } | { ok: false; error: string }> {
+    return binding.launchWrapper?.length
+      ? { ok: false, error: "launch_wrapper support unavailable; no agent started." }
+      : { ok: true };
   }
 
   protected override get commandName(): string | undefined {

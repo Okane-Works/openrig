@@ -157,7 +157,8 @@ describe("SeatHandoverPlanner", () => {
   });
 
   it("wires the daemon /api/seat/handover route", async () => {
-    const setup = createTestApp(db);
+    // The daemon always has its runtime adapters; a seat with none is refused, in a dry run too.
+    const setup = createTestApp(db, { adapters: { codex: { runtime: "codex" } as never } });
     const rig = setup.rigRepo.createRig("seat-rig");
     const node = setup.rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex" });
     const session = setup.sessionRegistry.registerSession(node.id, "dev-impl@seat-rig");

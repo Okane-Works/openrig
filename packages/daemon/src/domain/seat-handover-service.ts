@@ -8,10 +8,13 @@ import { readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 import { isLaunchWrapperRuntime, readSeatLaunchWrapper } from "./launch-wrapper.js";
 import { ulid } from "ulid";
 import type { RigRepository } from "./rig-repository.js";
-import { SessionAddressConflict, savedSessionName, type SessionRegistry } from "./session-registry.js";
+import { SessionAddressConflict, savedSessionName, sessionCommunityHarnessSelect, type SessionRegistry } from "./session-registry.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
+import { CommunityHarnessRuntimeAdapter, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
+import { isCommunityHarnessRuntime } from "./built-in-runtimes.js";
+import { usableCommunityNativeRef } from "./community-harness-launch-result.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { SeatStatusService, type SeatStatus, type SeatStatusResult } from "./seat-status-service.js";
@@ -27,7 +30,7 @@ import { readFootprintAnswer } from "./footprint-choice.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
 import { SuccessorSessionLauncher } from "./successor-session-launcher.js";
 import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
-import { validateResumeToken } from "./resume-token-validation.js";
+import { validateResumeToken, validateSessionFileFormat } from "./resume-token-validation.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import type { OccupantInvalidator } from "./occupant-invalidator.js";
 import type { JsonlExchange } from "./session-jsonl.js";
@@ -188,6 +191,8 @@ export type SeatHandoverResult =
   | { ok: false; code: "missing_reason" | "invalid_source" | "successor_creation_not_implemented" | "source_not_supported" | "resume_token_unavailable" | "fork_source_not_found"; message: string; guidance: string }
   | { ok: false; code: "address_conflict" | "current_occupant_required" | "discovered_not_active" | "successor_tmux_absent" | "successor_already_managed" | "successor_is_current" | "runtime_mismatch"; message: string; guidance: string }
   | { ok: false; code: "discovered_not_found"; message: string; guidance: string }
+  // The seat's successor can't be launched, known before anything is changed: the dry run and the real run both return it.
+  | { ok: false; code: "successor_runtime_unsupported"; message: string; guidance: string }
   | { ok: false; code: "tmux_probe_failed" | "handover_commit_failed" | "context_delivery_failed"; message: string; guidance: string;
     /** #3253: the successor went on without the seat's requested process limit before the failure. */
     processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice }
@@ -229,6 +234,7 @@ interface SessionRow {
   id: string;
   session_name: string;
   status: string;
+  community_harness: string | null;
 }
 
 interface BindingOwnerRow {
@@ -336,6 +342,7 @@ export class SeatHandoverService {
   private discoveryRepo: DiscoveryRepository;
   private eventBus: EventBus;
   private tmuxAdapter: TmuxAdapter;
+  private runtimeAdapters: Record<string, RuntimeAdapter>;
   private successorLauncher: SuccessorSessionLauncher;
   private captureDeps: ResumeTokenCaptureDeps;
   private occupantInvalidator: OccupantInvalidator | null;
@@ -365,6 +372,7 @@ export class SeatHandoverService {
     this.discoveryRepo = deps.discoveryRepo;
     this.eventBus = deps.eventBus;
     this.tmuxAdapter = deps.tmuxAdapter;
+    this.runtimeAdapters = deps.runtimeAdapters ?? {};
     this.occupantInvalidator = deps.occupantInvalidator ?? null;
     this.activityOracle = deps.activityOracle ?? null;
     this.predecessorRecapResolver = deps.predecessorRecapResolver ?? null;
@@ -410,6 +418,16 @@ export class SeatHandoverService {
         // A preview must not approve a fork source the real run refuses: resolve it the same way.
         const parsed = parseHandoverSource(input.source);
         const status = this.statusService.getStatus(input.seatRef);
+        // A preview must not approve a successor launch the real run refuses: the same check, in the same order.
+        if (status.ok && parsed.ok) {
+          const node = this.lookupNode(status.status);
+          const refusal = await this.successorLaunchRefusal(node, this.lookupLatestSession(node.id), parsed.source.mode);
+          if (refusal) return refusal;
+          if (parsed.source.mode !== "discovered") {
+            planResult.plan.runtimeAdapter = { status: "resolved_unverified",
+              detail: "The seat's runtime adapter resolved. The dry run did not start it or check that it becomes ready." };
+          }
+        }
         if (parsed.ok && parsed.source.mode === "fork" && parsed.source.ref && status.ok) {
           const fork = this.resolveForkSource(parsed.source.ref, this.lookupNode(status.status).runtime);
           if (!fork.ok) return fork;
@@ -493,6 +511,9 @@ export class SeatHandoverService {
         guidance: "Inspect the seat with: rig seat status <seat>",
       };
     }
+    // Before anything is changed: a successor that can't be launched is refused while the incumbent still runs.
+    const launchRefusal = await this.successorLaunchRefusal(node, latestSession, parsed.source.mode);
+    if (launchRefusal) return launchRefusal;
 
     if (parsed.source.mode !== "discovered") {
       // Preserve the existing exact-owner refusal before testing the new address.
@@ -672,7 +693,7 @@ export class SeatHandoverService {
       // spec (else the running topology drifts from the founder-designed one at every handover).
       // A4-profile: likewise carry the codex config profile (adapter emits -p) — the restore path
       // already threads it; handover must too, or a profile-pinned codex seat reverts at handover.
-      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, ...(codexRebuildPermissions ? { codexRebuildPermissions } : {}), ...(seatAdditions.additions ? { launchAdditions: seatAdditions.additions } : {}), ...(launchWrapper?.length ? { launchWrapper } : {}), claudePermissions: permissionOverride.claudePermissions, claudeAutoMode: permissionOverride.claudeAutoMode, claudeMcp, codexPermissions: permissionOverride.codexPermissions, kernelAuthority: permissionOverride.kernelAuthority, teamPermissionDefault: permissionOverride.teamPermissionDefault, nonInterruptive: this.rigRepo.getRigNonInterruptive(statusResult.status.rig_id), launchPosture: effectivePosture, ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}), model: node.model, effort: readSeatEffort(this.db, node.id)?.effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined, seatEnv: withPluginDirs(this.rigRepo.getEffectiveSeatEnv(node.id), [corePluginDir, seatSkillDir, ...additionPluginDirs]), ...((corePluginDir || codexCorePluginDir) && node.cwd ? { seatProjectDir: node.cwd } : {}) },
+      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, communityHarness: latestSession.community_harness, ...(codexRebuildPermissions ? { codexRebuildPermissions } : {}), ...(seatAdditions.additions ? { launchAdditions: seatAdditions.additions } : {}), ...(launchWrapper?.length ? { launchWrapper } : {}), claudePermissions: permissionOverride.claudePermissions, claudeAutoMode: permissionOverride.claudeAutoMode, claudeMcp, codexPermissions: permissionOverride.codexPermissions, kernelAuthority: permissionOverride.kernelAuthority, teamPermissionDefault: permissionOverride.teamPermissionDefault, nonInterruptive: this.rigRepo.getRigNonInterruptive(statusResult.status.rig_id), launchPosture: effectivePosture, ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}), model: node.model, effort: readSeatEffort(this.db, node.id)?.effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined, seatEnv: withPluginDirs(this.rigRepo.getEffectiveSeatEnv(node.id), [corePluginDir, seatSkillDir, ...additionPluginDirs]), ...((corePluginDir || codexCorePluginDir) && node.cwd ? { seatProjectDir: node.cwd } : {}) },
       departingSessionName: latestSession.session_name,
       occupantGeneration,
       // OPR.0.5.5.5: a fork-sourced successor launches as a NATIVE FORK of the
@@ -894,6 +915,8 @@ export class SeatHandoverService {
       // B2 (launched/fresh): the launch-scraped resume token captured by the
       // successor launcher is persisted atomically at commit (provenance scrape).
       launchToken,
+      ...(launch.resumeProvenance ? { launchTokenProvenance: launch.resumeProvenance } : {}),
+      ...(launch.communityRunner !== undefined ? { communityRunner: launch.communityRunner } : {}),
       occupantGeneration,
       appliedLaunch: launch.appliedLaunch ?? null,
       sourceOutcome,
@@ -1272,6 +1295,51 @@ export class SeatHandoverService {
     return { process: processNow, telemetry: records.telemetry, resumeToken: records.resumeToken };
   }
 
+  /** Why a handover can't launch this seat's successor, from what is known before anything is changed; null when it can
+   *  go ahead. The dry run and the real run both ask here, so a preview never approves a launch the real run refuses.
+   *  It resolves the adapter the way a launch does (`seatAdapter`, with the harness the seat's latest session recorded)
+   *  and, for a community harness, asks its preset what the launch itself would refuse. Nothing is started or stopped,
+   *  so readiness and the launch's own outcome stay unknown here. A discovered successor is already running: no check. */
+  private async successorLaunchRefusal(node: NodeRow, latestSession: SessionRow | null, mode: SeatHandoverSource["mode"]):
+    Promise<Extract<SeatHandoverResult, { code: "successor_runtime_unsupported" }> | null> {
+    if (mode === "discovered") return null;
+    const refuse = (message: string, guidance: string) => ({ ok: false as const, code: "successor_runtime_unsupported" as const,
+      message: `${message} Nothing was changed: the current occupant is still running and the seat's binding is as it was.`, guidance });
+    const runtime = node.runtime ?? "unknown";
+    let adapter: RuntimeAdapter | undefined;
+    try { adapter = seatAdapter(this.runtimeAdapters, node.runtime, latestSession?.community_harness); }
+    catch (error) {
+      return refuse(`The runtime adapter for "${runtime}" couldn't be resolved: ${error instanceof Error ? error.message : String(error)}.`,
+        "Inspect the seat with: rig seat status <seat>");
+    }
+    if (!adapter) {
+      if (!isCommunityHarnessRuntime(node.runtime)) {
+        return refuse(`No runtime adapter for "${runtime}", so a successor can't be launched for this seat.`,
+          "Inspect the seat with: rig seat status <seat>");
+      }
+      // Only a session launched for the harness resolves its adapter: a runtime name alone doesn't select a preset.
+      return latestSession?.community_harness === node.runtime
+        ? refuse(`Community harness "${runtime}" has no usable preset installed, so a successor can't be launched for this seat.`,
+          `Install or repair the preset for "${runtime}", then retry the handover.`)
+        : refuse(`The seat's latest session doesn't record community harness "${runtime}", so no adapter is selected for it and a successor can't be launched.`,
+          "A runtime name alone never selects a community preset. Inspect the seat with: rig seat status <seat>");
+    }
+    if (adapter instanceof CommunityHarnessRuntimeAdapter) {
+      const unsupported = adapter.handoverUnsupported() ?? (mode === "fork" ? adapter.forkUnsupported() : null);
+      if (unsupported) return refuse(unsupported, "Keep the current occupant running. Inspect the seat with: rig seat status <seat>");
+    }
+    if (!isCommunityHarnessRuntime(node.runtime) || !adapter.preflightLaunch) return null;
+    try {
+      const launchWrapper = isLaunchWrapperRuntime(node.runtime) ? readSeatLaunchWrapper(this.db, node.id) : undefined;
+      const checked = await adapter.preflightLaunch({ ...(launchWrapper?.length ? { launchWrapper } : {}) } as Parameters<NonNullable<RuntimeAdapter["preflightLaunch"]>>[0]);
+      if (!checked.ok) return refuse(checked.error, `Repair the preset or the seat's launch settings for "${runtime}", then retry the handover.`);
+    } catch (error) {
+      return refuse(`The launch check for community harness "${runtime}" failed: ${error instanceof Error ? error.message : String(error)}.`,
+        "Inspect the seat with: rig seat status <seat>");
+    }
+    return null;
+  }
+
   /** The successor's own resume token from its launch: a fork's is never its parent's (the fork source) nor the retiring
    *  occupant's; either answer from the launch-time capture is treated as not captured. */
   private successorLaunchToken(forkSource: { value: string } | null, resumeToken: string | undefined, resumeType: string | undefined,
@@ -1366,6 +1434,10 @@ export class SeatHandoverService {
     restorePacket?: SeatHandoverMutationResult["restorePacket"];
     /** Launch-scraped resume token for a fresh successor (persisted at commit). */
     launchToken: { token: string; resumeType?: string } | null;
+    /** A community harness's launch: who named launchToken (its launcher, or OpenRig), recorded unverified. */
+    launchTokenProvenance?: "launcher" | "passed";
+    /** A community harness's launch: the runner its preset declared, recorded with the successor's session. */
+    communityRunner?: boolean | "pi-rpc";
     /** Source-bound generation reserved before a fresh successor started; null for discovered seats. */
     occupantGeneration: string | null;
     /** Exact enforcing value returned by the launch adapter; absent for adopted/discovered successors. */
@@ -1491,6 +1563,8 @@ export class SeatHandoverService {
       departingProcess: input.departingProcess,
       restorePacket: input.restorePacket,
       launchToken: input.launchToken,
+      ...(input.launchTokenProvenance ? { launchTokenProvenance: input.launchTokenProvenance } : {}),
+      ...(input.communityRunner !== undefined ? { communityRunner: input.communityRunner } : {}),
       occupantGeneration: input.occupantGeneration,
       appliedLaunch: input.appliedLaunch,
       sourceOutcome: input.sourceOutcome,
@@ -1846,7 +1920,7 @@ export class SeatHandoverService {
 
   private lookupLatestSession(nodeId: string): SessionRow | null {
     return this.db.prepare(
-      "SELECT id, session_name, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1"
+      `SELECT id, session_name, status, ${sessionCommunityHarnessSelect(this.db, "sessions")} AS community_harness FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1`
     ).get(nodeId) as SessionRow | undefined ?? null;
   }
 
@@ -1876,6 +1950,8 @@ export class SeatHandoverService {
     departingProcess: SeatHandoverMutationResult["sideEffects"]["departingProcess"];
     restorePacket?: SeatHandoverMutationResult["restorePacket"];
     launchToken: { token: string; resumeType?: string } | null;
+    launchTokenProvenance?: "launcher" | "passed";
+    communityRunner?: boolean | "pi-rpc";
     occupantGeneration: string | null;
     appliedLaunch: AppliedLaunchObservation | null;
       sourceOutcome?: SeatHandoverMutationResult["sourceOutcome"];
@@ -1932,6 +2008,9 @@ export class SeatHandoverService {
         input.discovered.tmuxSession,
         "handover",
         input.occupantGeneration,
+        // A successor this handover launched through the seat's preset is the same seat continuing, so it keeps the
+        // harness. A discovered successor is a separately prepared session: it is not classified as the harness.
+        { keepCommunityHarness: input.reportedSource.mode !== "discovered" },
       );
       // #2985: adoption exists to register the generation the successor runs on (its hooks are held back until then).
       // Minting it is best-effort elsewhere; here it is the point, so without it nothing is adopted (rollback).
@@ -1943,6 +2022,12 @@ export class SeatHandoverService {
         this.db.prepare("UPDATE sessions SET origin = 'launched' WHERE id = ?").run(newSession.id);
         // It was launched in the seat's saved folder (the successor launch's node.cwd).
         this.sessionRegistry.recordLaunchedCwd(newSession.id, input.node.cwd);
+        // A community harness's successor was launched through its preset now, so the session records what that launch
+        // declared as its runner, as a launch does. The harness itself was kept by registerClaimedSession, from the
+        // retiring session; a discovered successor wasn't launched here and records no runner.
+        if (input.communityRunner !== undefined && newSession.communityHarness) {
+          this.sessionRegistry.recordCommunityHarnessSelection(newSession.id, newSession.communityHarness, input.communityRunner);
+        }
       }
       // The receipt's lineage record: that mint is best-effort (a failure is logged and swallowed), so read it back.
       const tenure = this.readOccupantTenure(input.node.id);
@@ -1963,9 +2048,30 @@ export class SeatHandoverService {
       // launch-token capture). Validity-guarded; a malformed token is dropped,
       // never a bad write. The token is never logged.
       if (input.launchToken) {
-        const validated = validateResumeToken(input.node.runtime, input.launchToken.token);
-        if (validated.ok) {
-          this.sessionRegistry.updateResumeToken(newSession.id, validated.resumeType, validated.token, "scrape");
+        const communityType = newSession.communityHarness ? `community:${newSession.communityHarness}` : null;
+        if (communityType) {
+          // Opaque community references require an exact harness type, valid
+          // native-ref grammar and launcher/passed provenance, without an
+          // independent verification stamp. Hosted Pi session files follow the
+          // separately validated runner-observation path below. Neither path
+          // copies the retiring session's token.
+          if (input.communityRunner === "pi-rpc" && input.launchToken.resumeType === communityType) {
+            // Hosted Pi reports a validated session-file observation, not an
+            // opaque launch-result reference. Match normal startup's scrape
+            // provenance without requiring launcher/passed metadata.
+            const validated = validateSessionFileFormat(input.launchToken.token, newSession.communityHarness!);
+            if (validated.ok) {
+              this.sessionRegistry.updateResumeToken(newSession.id, communityType, validated.token, "scrape");
+            }
+          } else if (input.launchTokenProvenance && input.launchToken.resumeType === communityType
+            && usableCommunityNativeRef(input.launchToken.token)) {
+            this.sessionRegistry.recordLauncherReportedToken(newSession.id, communityType, input.launchToken.token, input.launchTokenProvenance);
+          }
+        } else {
+          const validated = validateResumeToken(input.node.runtime, input.launchToken.token);
+          if (validated.ok) {
+            this.sessionRegistry.updateResumeToken(newSession.id, validated.resumeType, validated.token, "scrape");
+          }
         }
       }
       this.discoveryRepo.markClaimed(input.discovered.id, input.node.id);
