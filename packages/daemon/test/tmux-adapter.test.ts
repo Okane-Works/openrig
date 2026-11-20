@@ -1509,7 +1509,34 @@ describe("TmuxAdapter", () => {
     });
   });
 
-  describe("switchClient", () => {
+describe("listClientProcesses", () => {
+  it("reads client PIDs and sessions from this adapter's tmux server", async () => {
+    const exec = vi.fn<ExecFn>().mockResolvedValue("42|lead@team\n57|rig|view\n");
+    const adapter = new TmuxAdapter(exec);
+    expect(await adapter.listClientProcesses()).toEqual([
+      { pid: 42, session: "lead@team" }, { pid: 57, session: "rig|view" },
+    ]);
+    expect(exec.mock.calls[0]![0]).toBe('tmux list-clients -F "#{client_pid}|#{client_session}"');
+  });
+
+  it("rejects incomplete snapshots instead of reporting malformed clients as detached", async () => {
+    for (const row of ["bad", "x|lead@team", "0|lead@team", "-1|lead@team", "3.5|lead@team",
+      "1e3|lead@team", "9007199254740992|lead@team", "42|"]) {
+      const output = `43|valid@team\n${row}`;
+      await expect(new TmuxAdapter(mockExec({ "list-clients": { stdout: output } })).listClientProcesses())
+        .rejects.toThrow("Malformed tmux client process inventory");
+    }
+  });
+
+  it("treats an absent server as no clients but preserves read failures", async () => {
+    expect(await new TmuxAdapter(mockExec({ "list-clients": { error: NO_SERVER_ERROR } })).listClientProcesses())
+      .toEqual([]);
+    await expect(new TmuxAdapter(mockExec({ "list-clients": { error: new Error("Permission denied") } }))
+      .listClientProcesses()).rejects.toThrow("Permission denied");
+  });
+});
+
+describe("switchClient", () => {
     it("calls exec with exact `switch-client -c <client> -t <session>:<window>` command", async () => {
       const exec = vi.fn<ExecFn>().mockResolvedValue("");
       const adapter = new TmuxAdapter(exec);

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { HerdrViewer, createHerdrViewerRun } from "./herdr-viewer.js";
 import path from "node:path";
 import { HerdrAdapter } from "./herdr-adapter.js";
-import { createHerdrSocketRpc, createHerdrSocketTransport, resolveHerdrSocketPath } from "./herdr-transport.js";
+import { createHerdrSocketRpc, createHerdrSocketTransport, resolveHerdrSocketPath, type HerdrTransport } from "./herdr-transport.js";
 import type { ProviderStatus } from "./terminal-provider.js";
 import { HerdrFollowView, type ReadFollowInput } from "./herdr-follow-view.js";
 import { execArgvCommand } from "../../adapters/tmux-exec.js";
@@ -16,6 +16,8 @@ export function createHerdrProviders(env: NodeJS.ProcessEnv = process.env, input
   const defaultSocket = resolveHerdrSocketPath(env);
   let launch = 0;
   const viewers = new Map<string, HerdrViewer>();
+  // Each selected endpoint has its own status transport and sequence/cache scope.
+  const statusTransports = new Map<string, HerdrTransport>();
   const viewer = (endpoint: NonNullable<ProviderStatus["launch"]>) => {
     let selected = viewers.get(endpoint.socketPath);
     if (!selected) { selected = new HerdrViewer(endpoint.socketPath, createHerdrViewerRun(endpoint, env)); viewers.set(endpoint.socketPath, selected); }
@@ -23,6 +25,10 @@ export function createHerdrProviders(env: NodeJS.ProcessEnv = process.env, input
   };
   const make = (endpoint: NonNullable<ProviderStatus["launch"]>) => {
     const transportFactory = createHerdrSocketTransport(createHerdrSocketRpc(endpoint.socketPath));
+    if (!statusTransports.has(endpoint.socketPath)) {
+      statusTransports.set(endpoint.socketPath,
+        createHerdrSocketTransport(createHerdrSocketRpc(endpoint.socketPath, 1000))());
+    }
     return new HerdrAdapter({
     transportFactory,
     following: new HerdrFollowView({ socketPath: endpoint.socketPath, run: createHerdrViewerRun(endpoint, env), transport: transportFactory(), input }),
@@ -34,6 +40,7 @@ export function createHerdrProviders(env: NodeJS.ProcessEnv = process.env, input
   }); };
   const sessions = new Map<string, HerdrAdapter>();
   return {
+    statusTransports: (): readonly HerdrTransport[] => [...statusTransports.values()],
     defaultProvider: make({ socketPath: defaultSocket, ...(env.HERDR_SESSION ? { session: env.HERDR_SESSION } : {}) }),
     // TerminalService validates this as one session name, not a filesystem path.
     sessionProvider: (session: string) => {

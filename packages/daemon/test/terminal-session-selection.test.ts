@@ -89,6 +89,24 @@ const layouts = (requests: Request[]) => requests.filter(request => request.meth
 // Real Hono/service/provider/socket wiring, with a synthetic Herdr protocol peer.
 // These checks prove endpoint routing, not desktop rendering by the Herdr app.
 describe.skipIf(process.platform === "win32")("per-request Herdr session selection", () => {
+  it("keeps status transports stable and scoped to selected endpoints", async () => {
+    const f = await fixture();
+    const initial = f.providers.statusTransports();
+    expect(initial).toHaveLength(1);
+    f.providers.sessionProvider("prod");
+    f.providers.sessionProvider("prod");
+    f.providers.sessionProvider("daemon-configured");
+    const selected = f.providers.statusTransports();
+    expect(selected).toHaveLength(2);
+    expect(selected[0]).toBe(initial[0]);
+    expect(f.providers.statusTransports()[1]).toBe(selected[1]);
+    await Promise.all(selected.map(transport => transport.probe()));
+    expect(f.hits.configured.filter(request => request.method === "ping")).toHaveLength(1);
+    expect(f.hits.prod.filter(request => request.method === "ping")).toHaveLength(1);
+    expect(f.hits.stage).toHaveLength(0);
+    expect(f.hits.default).toHaveLength(0);
+  });
+
   it("default selection without a socket override uses the configured session under XDG_CONFIG_HOME", async () => {
     const f = await fixture({ xdg: true, configuredSession: "prod", socketOverride: false });
     expect(await (await f.open({ view: "prod" })).json()).toMatchObject({ ok: true });
