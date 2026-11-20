@@ -24,6 +24,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { ClaimService } from "../src/domain/claim-service.js";
 import { SelfAttachService } from "../src/domain/self-attach-service.js";
 import { SeatHandoverService } from "../src/domain/seat-handover-service.js";
+import { PiCommunityRuntimeAdapter } from "../src/adapters/pi-community-runtime-adapter.js";
+import { loadCommunityHarnessPreset } from "../src/domain/community-harness-presets.js";
 import { CommunityHarnessRuntimeAdapter, seatAdapter, withCommunityHarnessResolver } from "../src/adapters/community-harness-runtime-adapter.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import type { RuntimeAdapter, NodeBinding } from "../src/domain/runtime-adapter.js";
@@ -509,6 +511,48 @@ describe("a community harness's seat keeps its harness when its session row is r
       expect(latest(node.id)).toMatchObject({ status: "running", origin: "launched", agent_app: harness, agent_runner: 0,
         resume_type: `community:${harness}`, resume_token: "chat-new", resume_provenance: "launcher", resume_last_verified: null });
       expect(relaunchAdapter(node.id, map)).toBeInstanceOf(CommunityHarnessRuntimeAdapter);
+    });
+
+    function hostedPiAdapter(token: string, resumeType = "community:future-pi"): PiCommunityRuntimeAdapter {
+      installPreset("future-pi", "protocol: pi-rpc\n");
+      const found = loadCommunityHarnessPreset("future-pi", presets);
+      if (!found.ok) throw new Error(found.message);
+      const adapter = new PiCommunityRuntimeAdapter("future-pi", found.preset, {
+        tmux: {} as TmuxAdapter, stateRoot: "/state", runnerEntryPath: "/runner.js",
+        fsOps: { readFile: () => "", writeFile: () => {}, exists: () => false, mkdirp: () => {} },
+      });
+      // The actual hosted adapter class determines protocol provenance. Only
+      // the native runner boundary is simulated, as with opaque launch tests.
+      vi.spyOn(adapter, "launchHarness").mockResolvedValue({ ok: true, resumeToken: token, resumeType });
+      vi.spyOn(adapter, "checkReady").mockResolvedValue({ ready: true });
+      return adapter;
+    }
+
+    it.each([
+      "/state/dev-impl@seat-rig/conversation.jsonl",
+      `/state/${"a".repeat(240)}/${"b".repeat(240)}/${"c".repeat(80)}.jsonl`,
+    ])("keeps a hosted Pi successor's validated session-file token (%s)", async token => {
+      const adapter = hostedPiAdapter(token);
+      const { node } = seedSeat("future-pi", { launchedFor: "future-pi" });
+      expect(await handoverService({ "future-pi": adapter }).handover({ seatRef: SEAT, source: "fresh", reason: "hosted runner" }))
+        .toMatchObject({ ok: true });
+      expect(latest(node.id)).toMatchObject({ agent_app: "future-pi", agent_runner: 2,
+        resume_type: "community:future-pi", resume_token: token, resume_provenance: "scrape",
+        resume_last_verified: expect.any(String) });
+    });
+
+    it.each([
+      ["relative.jsonl", "community:future-pi"],
+      ["/state/../conversation.jsonl", "community:future-pi"],
+      ["/state/not-session.txt", "community:future-pi"],
+      ["/state/conversation.jsonl", "community:another-harness"],
+    ])("drops a hosted Pi launch's malformed or mismatched session token", async (token, type) => {
+      const adapter = hostedPiAdapter(token!, type!);
+      const { node } = seedSeat("future-pi", { launchedFor: "future-pi" });
+      expect(await handoverService({ "future-pi": adapter }).handover({ seatRef: SEAT, source: "fresh", reason: "hosted runner" }))
+        .toMatchObject({ ok: true });
+      expect(latest(node.id)).toMatchObject({ agent_app: "future-pi", agent_runner: 2,
+        resume_type: null, resume_token: null, resume_provenance: null, resume_last_verified: null });
     });
 
     it("hands the same seat over again: the successor of a handover is still a harness seat", async () => {

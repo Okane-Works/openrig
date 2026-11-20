@@ -30,7 +30,7 @@ import { readFootprintAnswer } from "./footprint-choice.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
 import { SuccessorSessionLauncher } from "./successor-session-launcher.js";
 import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
-import { validateResumeToken } from "./resume-token-validation.js";
+import { validateResumeToken, validateSessionFileFormat } from "./resume-token-validation.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import type { OccupantInvalidator } from "./occupant-invalidator.js";
 import type { JsonlExchange } from "./session-jsonl.js";
@@ -2050,11 +2050,20 @@ export class SeatHandoverService {
       if (input.launchToken) {
         const communityType = newSession.communityHarness ? `community:${newSession.communityHarness}` : null;
         if (communityType) {
-          // A community harness's conversation is its own: recorded only when this launch named it as this harness's,
-          // with who named it, and with no verification stamp (neither a launcher's report nor a passed name is one).
-          // It must be this harness's own type and fit the conversation grammar a launch record is held to; anything
-          // else is dropped, never stored. The retiring session's token is never copied here.
-          if (input.launchTokenProvenance && input.launchToken.resumeType === communityType
+          // Opaque community references require an exact harness type, valid
+          // native-ref grammar and launcher/passed provenance, without an
+          // independent verification stamp. Hosted Pi session files follow the
+          // separately validated runner-observation path below. Neither path
+          // copies the retiring session's token.
+          if (input.communityRunner === "pi-rpc" && input.launchToken.resumeType === communityType) {
+            // Hosted Pi reports a validated session-file observation, not an
+            // opaque launch-result reference. Match normal startup's scrape
+            // provenance without requiring launcher/passed metadata.
+            const validated = validateSessionFileFormat(input.launchToken.token, newSession.communityHarness!);
+            if (validated.ok) {
+              this.sessionRegistry.updateResumeToken(newSession.id, communityType, validated.token, "scrape");
+            }
+          } else if (input.launchTokenProvenance && input.launchToken.resumeType === communityType
             && usableCommunityNativeRef(input.launchToken.token)) {
             this.sessionRegistry.recordLauncherReportedToken(newSession.id, communityType, input.launchToken.token, input.launchTokenProvenance);
           }
